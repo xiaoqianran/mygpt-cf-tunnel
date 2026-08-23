@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Universal VPS Root Shell",
-    "version": "0.5.3",
-    "description": "A single authenticated action exposes the remote VPS root shell. It can use or install software as needed, read/write host files, run programs, manage services, call APIs, and compose arbitrary non-interactive workflows. Named tools are examples, never a capability boundary."
+    "version": "0.6.0",
+    "description": "Authenticated universal remote VPS root shell. It can install or use software and run arbitrary non-interactive workflows; installed tools are not a capability boundary. Large command output can be returned as GPT Action file attachments instead of oversized inline JSON."
   },
   "servers": [
     {
@@ -80,18 +80,22 @@
           },
           "stdout": {
             "type": "string",
-            "description": "Current rolling stdout tail, available while running."
+            "description": "Complete stdout for terminal jobs when it fits; otherwise a live or terminal preview."
           },
           "stderr": {
             "type": "string",
-            "description": "Current rolling stderr tail, available while running."
+            "description": "Complete stderr for terminal jobs when it fits; otherwise a live or terminal preview."
           },
           "timed_out": {
             "type": "boolean"
           },
           "truncated": {
             "type": "boolean",
-            "description": "True when stored output or the requested tail omits older output."
+            "description": "For running snapshots, true when the current response omits output. For terminal jobs, true only when some command output was actually lost."
+          },
+          "inline_truncated": {
+            "type": "boolean",
+            "description": "True when stdout/stderr in this JSON are only a preview. For terminal results, use openaiFileResponse for the complete output."
           },
           "duration_ms": {
             "type": "integer",
@@ -112,6 +116,27 @@
             "type": "integer",
             "minimum": 1,
             "description": "Monotonic job revision. Pass the last seen value as after to wait for the next change."
+          },
+          "openaiFileResponse": {
+            "type": "array",
+            "description": "Complete command output files returned through the GPT Actions file-response mechanism when inline JSON would be too large. Up to 10 text files may be returned.",
+            "items": {
+              "type": "string",
+              "format": "uri"
+            }
+          },
+          "full_output_attached": {
+            "type": "boolean",
+            "description": "True when the attached files contain all command output even if inline stdout/stderr are previews."
+          },
+          "capture_truncated": {
+            "type": "boolean",
+            "description": "True only when command output exceeded the attachment capture capacity; false means attached output is complete."
+          },
+          "output_file_ttl_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Lifetime of the unguessable attachment URLs."
           }
         },
         "required": [
@@ -127,6 +152,71 @@
           "duration_ms",
           "started_at"
         ]
+      },
+      "CommandResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "workdir": {
+            "type": "string"
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "stdout": {
+            "type": "string",
+            "description": "Complete inline stdout when it fits; otherwise a small preview while full output is attached."
+          },
+          "stderr": {
+            "type": "string",
+            "description": "Complete inline stderr when it fits; otherwise a small preview while full output is attached."
+          },
+          "timed_out": {
+            "type": "boolean"
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "True only when some command output was actually lost. False when complete output is inline or preserved in attached files."
+          },
+          "inline_truncated": {
+            "type": "boolean",
+            "description": "True when stdout/stderr in this JSON are only a preview. For terminal results, use openaiFileResponse for the complete output."
+          },
+          "duration_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "openaiFileResponse": {
+            "type": "array",
+            "description": "Complete command output files returned through the GPT Actions file-response mechanism when inline JSON would be too large. Up to 10 text files may be returned.",
+            "items": {
+              "type": "string",
+              "format": "uri"
+            }
+          },
+          "full_output_attached": {
+            "type": "boolean",
+            "description": "True when the attached files contain all command output even if inline stdout/stderr are previews."
+          },
+          "capture_truncated": {
+            "type": "boolean",
+            "description": "True only when command output exceeded the attachment capture capacity; false means attached output is complete."
+          },
+          "output_file_ttl_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Lifetime of the unguessable attachment URLs."
+          }
+        },
+        "required": [
+          "workdir",
+          "exit_code",
+          "stdout",
+          "stderr",
+          "timed_out",
+          "truncated",
+          "duration_ms"
+        ]
       }
     }
   },
@@ -136,7 +226,7 @@
         "operationId": "runCommand",
         "x-openai-isConsequential": false,
         "summary": "Run a root shell workflow on the remote VPS",
-        "description": "Runs any non-interactive root shell workflow via /bin/bash -lc; installed tools are not a capability boundary. Use for short commands. Cloudflare currently documents a 125-second default Proxy Read Timeout; prefer startCommand for long work to avoid HTTP 524.",
+        "description": "Runs a non-interactive root shell workflow via /bin/bash -lc. Use for short work. GPT Actions time out long requests; prefer startCommand for long work. Oversized stdout/stderr is returned as attached text files.",
         "requestBody": {
           "required": true,
           "content": {
@@ -149,7 +239,14 @@
         },
         "responses": {
           "200": {
-            "description": "Workflow finished. Inspect exit_code, stdout, stderr, timed_out and truncated before deciding the next step."
+            "description": "Workflow finished. Large output may be delivered through openaiFileResponse attachments instead of oversized inline JSON.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandResult"
+                }
+              }
+            }
           },
           "400": {
             "description": "Invalid request."
@@ -197,7 +294,7 @@
         "operationId": "getCommandJob",
         "x-openai-isConsequential": false,
         "summary": "Get an asynchronous command job",
-        "description": "Returns a flat job snapshot with live rolling stdout/stderr. For event-driven observation, pass the last revision as after; the request returns immediately on output/status change or after a short wait timeout.",
+        "description": "Returns a job snapshot. Use revision-based long polling while running. Terminal output is returned inline when safe, or as GPT Action text-file attachments when too large for one JSON payload.",
         "parameters": [
           {
             "name": "id",
@@ -241,7 +338,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Current job snapshot. A matching running revision waits for output/status change or the requested heartbeat timeout.",
+            "description": "Current job snapshot. Terminal large output may include openaiFileResponse attachments containing the complete captured output.",
             "content": {
               "application/json": {
                 "schema": {

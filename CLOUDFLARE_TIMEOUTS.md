@@ -1,6 +1,16 @@
-# Cloudflare timeout facts for this project
+# GPT Action and Cloudflare timeout facts for this project
 
-Verified against Cloudflare's official documentation on **2026-08-23**.
+GPT Actions limits were verified against OpenAI official documentation on **2026-08-24**. Cloudflare limits were verified against Cloudflare official documentation on **2026-08-23**.
+
+## The first timeout that matters in Custom GPT
+
+OpenAI currently documents a **45-second round-trip timeout for GPT Action API calls**. It also documents that normal Action request and response payloads must each be **less than 100,000 characters**.
+
+For this project that means the Custom GPT path normally hits the OpenAI Action timeout before Cloudflare's 125-second proxy read timeout. Use `runCommand` only for work that is expected to finish comfortably below the Action boundary. Use `startCommand` for builds, deploys, installs, model jobs, large exports, or any workflow that may approach 45 seconds; observe it with `getCommandJob`.
+
+Large output is a separate transport problem. Do not increase inline JSON until it crosses the 100,000-character Action limit. The Agent keeps the Action JSON small and returns oversized stdout/stderr through GPT Actions' official `openaiFileResponse` file mechanism.
+
+OpenAI source: `https://developers.openai.com/api/docs/actions/production`.
 
 ## The number that matters for HTTP 524
 
@@ -35,7 +45,7 @@ GET  /v1/command/jobs/{id}    -> poll status/result
 POST /v1/command/jobs/{id}/cancel
 ```
 
-Use `runCommand` for short commands. Prefer `startCommand` for builds, deploys, installs, model jobs, large exports, or anything that might approach the Cloudflare proxy timeout.
+Use `runCommand` for short commands. Prefer `startCommand` for builds, deploys, installs, model jobs, large exports, or anything that might approach the earlier **45-second GPT Action timeout**; the Cloudflare 125-second boundary still matters for non-Action/direct clients.
 
 For live observation, `getCommandJob` uses revision-based long polling with a 10-second default and 20-second maximum wait. A request returns sooner whenever stdout, stderr, or job status changes. These waits stay intentionally far below Cloudflare's documented 125-second default Proxy Read Timeout.
 

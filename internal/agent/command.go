@@ -19,11 +19,15 @@ import (
 const commonPath = "/root/.local/bin:/root/.cargo/bin:/root/go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
 
 type cappedBuffer struct {
-	mu        sync.RWMutex
-	buf       bytes.Buffer
-	limit     int
-	truncated bool
-	onWrite   func()
+	mu               sync.RWMutex
+	buf              bytes.Buffer
+	limit            int
+	truncated        bool
+	onWrite          func()
+	capturePool      *capturePool
+	captureParts     []*os.File
+	capturePartSizes []int64
+	captureTruncated bool
 }
 
 func (w *cappedBuffer) Write(p []byte) (int, error) {
@@ -33,6 +37,7 @@ func (w *cappedBuffer) Write(p []byte) (int, error) {
 	}
 
 	w.mu.Lock()
+	w.captureLocked(p)
 	if len(p) >= w.limit {
 		w.buf.Reset()
 		_, _ = w.buf.Write(p[len(p)-w.limit:])
@@ -53,6 +58,66 @@ func (w *cappedBuffer) Write(p []byte) (int, error) {
 		onWrite()
 	}
 	return n, nil
+}
+
+func (w *cappedBuffer) captureLocked(p []byte) {
+	if w.capturePool == nil || w.captureTruncated || len(p) == 0 {
+		return
+	}
+	for len(p) > 0 {
+		partIndex := len(w.captureParts) - 1
+		if partIndex < 0 || w.capturePartSizes[partIndex] >= maxActionFileBytes {
+			f, ok := w.capturePool.newPart()
+			if !ok {
+				w.captureTruncated = true
+				return
+			}
+			w.captureParts = append(w.captureParts, f)
+			w.capturePartSizes = append(w.capturePartSizes, 0)
+			partIndex++
+		}
+		remaining := maxActionFileBytes - w.capturePartSizes[partIndex]
+		want := int64(len(p))
+		if want > remaining {
+			want = remaining
+		}
+		nn, err := w.captureParts[partIndex].Write(p[:int(want)])
+		w.capturePartSizes[partIndex] += int64(nn)
+		if err != nil || nn != int(want) {
+			w.captureTruncated = true
+			return
+		}
+		p = p[nn:]
+	}
+}
+
+func (w *cappedBuffer) finalizeCapture() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, f := range w.captureParts {
+		_ = f.Close()
+	}
+}
+
+func (w *cappedBuffer) capturedParts() ([]capturePart, bool) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	parts := make([]capturePart, 0, len(w.captureParts))
+	for i, f := range w.captureParts {
+		parts = append(parts, capturePart{Path: f.Name(), Size: w.capturePartSizes[i]})
+	}
+	return parts, w.captureTruncated
+}
+
+func (w *cappedBuffer) cleanupCapture() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, f := range w.captureParts {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+	}
+	w.captureParts = nil
+	w.capturePartSizes = nil
 }
 
 func (w *cappedBuffer) snapshot() (string, bool) {
@@ -142,6 +207,26 @@ func (s *Server) newCappedBuffer() *cappedBuffer {
 		limit = 180000
 	}
 	return &cappedBuffer{limit: limit}
+}
+
+func (s *Server) newCapturedBuffer(pool *capturePool) *cappedBuffer {
+	buf := s.newCappedBuffer()
+	buf.capturePool = pool
+	return buf
+}
+
+func (s *Server) runHostCommandCaptured(ctx context.Context, command, workdir, stdin string, timeoutSeconds int) (hostCommandResult, *cappedBuffer, *cappedBuffer, error) {
+	pool := newCapturePool()
+	stdout := s.newCapturedBuffer(pool)
+	stderr := s.newCapturedBuffer(pool)
+	result, err := s.runHostCommandTo(ctx, command, workdir, stdin, timeoutSeconds, stdout, stderr)
+	stdout.finalizeCapture()
+	stderr.finalizeCapture()
+	if err != nil {
+		stdout.cleanupCapture()
+		stderr.cleanupCapture()
+	}
+	return result, stdout, stderr, err
 }
 
 func (s *Server) runHostCommandTo(ctx context.Context, command, workdir, stdin string, timeoutSeconds int, stdout, stderr *cappedBuffer) (hostCommandResult, error) {

@@ -12,23 +12,25 @@ import (
 	"time"
 )
 
-const serviceVersion = "0.5.3"
-const openAPIContractVersion = "0.5.3"
+const serviceVersion = "0.6.0"
+const openAPIContractVersion = "0.6.0"
 const maxRequestBodyBytes = 16 << 20
 
 type Server struct {
-	cfg  Config
-	jobs *jobStore
+	cfg   Config
+	jobs  *jobStore
+	files *outputFileStore
 }
 
 func NewServer(cfg Config) *Server {
-	return &Server{cfg: cfg, jobs: newJobStore()}
+	return &Server{cfg: cfg, jobs: newJobStore(), files: newOutputFileStore()}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /openapi.json", s.handleOpenAPI)
+	mux.HandleFunc("GET /v1/output-files/{token}", s.handleOutputFile)
 	mux.Handle("POST /v1/command/run", s.CommandEndpoint())
 	mux.Handle("POST /v1/command/start", s.auth(http.HandlerFunc(s.handleStartCommand)))
 	mux.Handle("GET /v1/command/jobs/{id}", s.auth(http.HandlerFunc(s.handleGetCommandJob)))
@@ -100,15 +102,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleOpenAPI(w http.ResponseWriter, r *http.Request) {
-	scheme := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
-	if scheme == "" {
-		if r.TLS != nil {
-			scheme = "https"
-		} else {
-			scheme = "http"
-		}
-	}
-	origin := scheme + "://" + r.Host
+	origin := requestOrigin(r)
 	spec := strings.ReplaceAll(openAPISpec, "__SERVER_URL__", origin)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")

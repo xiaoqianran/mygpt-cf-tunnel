@@ -281,6 +281,8 @@ systemd 的 EnvironmentFile 是：
 
 ### 超时
 
+Custom GPT Action 层本身有 **45 秒 round-trip** 硬超时；因此同步 `runCommand` 即使服务端允许更久，也不适合可能接近 45 秒的工作。长任务应使用 `startCommand` + `getCommandJob`，把命令生命周期与单次 HTTP Action 解耦。
+
 服务端默认：
 
 ```text
@@ -291,29 +293,25 @@ COMMAND_TIMEOUT_SECONDS=86400
 
 发生超时时，Agent 会终止当前 shell 的整个进程组，避免只杀掉外层 bash 后留下子进程继续运行。
 
-### 输出截断
+### 大输出与 GPT Action 文件附件
 
-默认单个 stdout/stderr buffer 上限由：
+GPT Actions 的普通 JSON request/response 有独立的平台 payload 上限，因此提高单个 JSON `stdout` 的尺寸并不能无限扩大 GPT 实际收到的输出。`MAX_COMMAND_OUTPUT_CHARS` 现在只控制内存中的滚动 stdout/stderr 预览：
 
 ```text
 MAX_COMMAND_OUTPUT_CHARS=180000
 ```
 
-控制。
+对于能安全放进 Action JSON 的小输出，`runCommand` / 终态 `getCommandJob` 仍直接返回完整 `stdout` 和 `stderr`。一旦输出过大，Agent 会自动把完整命令输出保存为短期文本文件，通过 GPT Actions 官方 `openaiFileResponse` 机制返回，同时只在 JSON 中保留小型预览。
 
-大型仓库、日志或数据应先定位再读取，例如使用：
+当前实现每个附件片段最多约 **9.5 MB**，stdout/stderr 合计最多 **10 个附件**，即一次命令最多约 **95 MB** 的完整文本输出可以进入对话；这是在 GPT Actions 官方“最多 10 个文件、每个最多 10 MB”约束下保留安全余量。同步命令生成的附件 URL 使用随机 256-bit token，默认 15 分钟失效。
 
-```bash
-rg
-find
-sed -n
-head
-tail
-git diff --stat
-journalctl -n
-```
+返回字段的语义：
 
-如果返回 `truncated: true`，应该缩小范围继续查询，而不是再次输出全部内容。
+- `truncated: false` + `inline_truncated` 缺省/false：完整输出已直接内联；
+- `truncated: false` + `inline_truncated: true` + `full_output_attached: true`：JSON 里的 stdout/stderr 只是预览，但**完整命令输出没有丢失，已经作为附件返回**；
+- `truncated: true` / `capture_truncated: true`：命令输出超过附件捕获容量或捕获失败，此时才意味着完整输出确实没有全部保存。
+
+因此，大日志不再因为 `MAX_COMMAND_OUTPUT_CHARS` 被永久丢掉，也不需要仅为了绕过传输上限而手工改成 `grep` / `tail`。定位型命令仍然适合减少无关上下文，但它变成效率选择，而不是防截断的必需操作。
 
 ## 非交互式工作流
 

@@ -100,16 +100,16 @@ OpenAPI 刻意保持简短。它只描述认证、命令执行的同步/异步�
 
 当前兼容约束包括：
 
-- `components.schemas` 始终显式为 `{}`，即使暂时没有复用 schema。
+- `components.schemas` 显式描述命令结果与 Job 结果；大输出字段包含 GPT Actions 官方 `openaiFileResponse` 文件返回契约。
 - OpenAPI 中关键 `description` 保持在 300 字符以内。
 - Action 面只提供同一个 shell 执行原语的同步与异步生命周期；“缺工具就安装、按目标组合任意工作流”的行为策略由 GPT 指令表达。
 - CI 对上述约束做回归测试，避免 Builder 导入在后续修改中再次失效。
 
 ## 长任务与 524
 
-> Cloudflare 当前超时事实、官方来源与下载快照见 [`CLOUDFLARE_TIMEOUTS.md`](./CLOUDFLARE_TIMEOUTS.md)。默认 Proxy Read Timeout 当前为 **125 秒**，不要使用旧的 100 秒记忆。
+> Custom GPT 的同步 Action 更早受 OpenAI **45 秒 round-trip** 限制，普通 Action request/response 还必须分别少于 **100,000 字符**。Cloudflare 默认 Proxy Read Timeout 是 **125 秒**。完整边界与来源见 [`CLOUDFLARE_TIMEOUTS.md`](./CLOUDFLARE_TIMEOUTS.md)。
 
-短任务使用 `runCommand`。长任务使用 `startCommand`，立即取得 job id。`getCommandJob` 在 `running` 阶段暴露 rolling `stdout` / `stderr` 和单调递增的 `revision`。把上次 revision 作为 `after` 并设置 `wait_seconds=10`，服务端会在日志/状态变化时立即返回，而不是让客户端固定 sleep；完全无变化时才按约 10 秒 heartbeat 返回。长轮询默认只返回最近 12000 个 Unicode 字符，可用 `tail_chars` 调整；普通快照仍返回完整的已保存 rolling output。Job 使用独立 context，观察请求断开不会取消任务；需要停止时显式调用 `cancelCommandJob`。终态 Job 最多保留 24 小时且最多保留最近 256 条；Agent 重启后会清空。
+短任务使用 `runCommand`。可能接近 45 秒的任务使用 `startCommand`，立即取得 job id。`getCommandJob` 在 `running` 阶段暴露 rolling `stdout` / `stderr` 和单调递增的 `revision`。把上次 revision 作为 `after` 并设置 `wait_seconds=10`，服务端会在日志/状态变化时立即返回，而不是让客户端固定 sleep；完全无变化时才按约 10 秒 heartbeat 返回。长轮询默认只返回最近 12000 个 Unicode 字符，可用 `tail_chars` 调整。终态输出若能安全放进 Action JSON 就直接完整内联；过大时自动通过 `openaiFileResponse` 返回完整文本附件。Job 使用独立 context，观察请求断开不会取消任务；需要停止时显式调用 `cancelCommandJob`。终态 Job 最多保留 24 小时且最多保留最近 256 条；Agent 重启后会清空。
 
 ## Action 请求
 
@@ -145,6 +145,10 @@ root user
 ```
 
 `stdin` 可用于非交互式 CLI 输入、脚本、payload 或文件内容。
+
+当 stdout/stderr 太大而不适合放进单个 GPT Action JSON 时，返回体会保留约 6000 字符预览，并增加 `openaiFileResponse`、`inline_truncated`、`full_output_attached`、`capture_truncated`。当前实现按每片约 9.5 MB、最多 10 片捕获，约可完整携带 95 MB 文本输出。`truncated: false`、`inline_truncated: true`、`full_output_attached: true`、`capture_truncated: false` 表示只有内联预览被缩短，完整输出已经作为附件返回，并没有丢失；只有 `truncated: true` 才代表输出确实有丢失。
+
+`MAX_COMMAND_OUTPUT_CHARS` 只控制内存中的 rolling inline preview，不再是完整命令输出的总容量。不要通过无限提高该值试图突破 GPT Actions 的 JSON payload 限制。
 
 `timeout_seconds` 只能缩短本次调用的时间，不能突破服务器端 `COMMAND_TIMEOUT_SECONDS`。超时后 Agent 会终止整个 shell 进程组，避免留下意外的子进程。
 
@@ -241,4 +245,4 @@ Cloudflare Tunnel
 - Agent origin 应继续只监听 loopback，不要直接暴露公网。
 - root shell 可以安装软件、修改系统、删除文件、停止服务、访问 root 可读取的凭据；这是设计目标，不是 sandbox。
 - OpenAPI 把操作标记为 non-consequential，以避免已授权场景下的逐次确认；工具本身仍具有真实 root 级副作用。
-- 输出会按 `MAX_COMMAND_OUTPUT_CHARS` 截断；超时由 `COMMAND_TIMEOUT_SECONDS` 控制。
+- `MAX_COMMAND_OUTPUT_CHARS` 只限制 rolling 内联预览；大型完整输出通过短期 `openaiFileResponse` 附件返回。超时由 `COMMAND_TIMEOUT_SECONDS` 控制。

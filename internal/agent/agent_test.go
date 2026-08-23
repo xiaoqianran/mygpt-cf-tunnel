@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -136,7 +137,7 @@ func TestOpenAPIExposesUniversalNonConsequentialRunCommand(t *testing.T) {
 }
 
 func TestOpenAPIContractIsFrozen(t *testing.T) {
-	const want = "b703d50a1f9817bf537a6802bda4b83122e765450ab075e1d096086ab9ee3872"
+	const want = "66a83f4cff2ec59b2b49768235f47daa458e693e54b66e5d28a754b6bf718b42"
 	got := fmt.Sprintf("%x", sha256.Sum256([]byte(openAPISpec)))
 	if got != want {
 		t.Fatalf("OpenAPI contract changed: got %s want %s; review OPENAPI_CONTRACT.md before updating the lock", got, want)
@@ -630,5 +631,94 @@ func TestNaturalExitResultIsNotReclassifiedAfterCancellation(t *testing.T) {
 	cancel()
 	if result.cancelled || result.TimedOut || result.ExitCode != 0 {
 		t.Fatalf("natural exit was reclassified after cancellation: %#v", result)
+	}
+}
+
+func TestLargeRunCommandReturnsCompleteActionFile(t *testing.T) {
+	s := NewServer(Config{APIToken: "test-token", CommandTimeout: 3 * time.Second, MaxCommandOutputChars: 20000})
+	body, err := json.Marshal(commandInput{Command: `printf '%0200000d' 0`, Workdir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/command/run", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("run status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.Len() >= maxActionJSONBytes {
+		t.Fatalf("action JSON is too large: %d bytes", rec.Body.Len())
+	}
+
+	var result commandActionResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Truncated || !result.InlineTruncated || !result.FullOutputAttached || result.CaptureTruncated {
+		t.Fatalf("unexpected attachment state: %#v", result)
+	}
+	if len(result.OpenAIFileResponse) != 1 {
+		t.Fatalf("attachment count=%d want=1: %#v", len(result.OpenAIFileResponse), result.OpenAIFileResponse)
+	}
+	if len(result.Stdout) > attachmentPreviewChars {
+		t.Fatalf("inline preview too large: %d chars", len(result.Stdout))
+	}
+
+	u, err := url.Parse(result.OpenAIFileResponse[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileReq := httptest.NewRequest(http.MethodGet, u.RequestURI(), nil)
+	fileRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(fileRec, fileReq)
+	if fileRec.Code != http.StatusOK {
+		t.Fatalf("file status=%d body=%s", fileRec.Code, fileRec.Body.String())
+	}
+	if fileRec.Body.Len() != 200000 {
+		t.Fatalf("file bytes=%d want=200000", fileRec.Body.Len())
+	}
+	if !strings.HasPrefix(fileRec.Header().Get("Content-Disposition"), "attachment;") {
+		t.Fatalf("missing attachment Content-Disposition: %q", fileRec.Header().Get("Content-Disposition"))
+	}
+	if strings.Trim(fileRec.Body.String(), "0") != "" {
+		t.Fatal("attachment content differs from full stdout")
+	}
+}
+
+func TestSmallRunCommandStaysInline(t *testing.T) {
+	s := NewServer(Config{APIToken: "test-token", CommandTimeout: 3 * time.Second, MaxCommandOutputChars: 20000})
+	body := strings.NewReader(`{"command":"printf hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/command/run", body)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var result commandActionResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Stdout != "hello" || result.Truncated || result.FullOutputAttached || len(result.OpenAIFileResponse) != 0 {
+		t.Fatalf("small output should remain inline: %#v", result)
+	}
+}
+
+func TestOpenAPIExposesActionFileResponse(t *testing.T) {
+	var spec struct {
+		Components struct {
+			Schemas map[string]struct {
+				Properties map[string]any `json:"properties"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal([]byte(openAPISpec), &spec); err != nil {
+		t.Fatal(err)
+	}
+	for _, schemaName := range []string{"CommandResult", "CommandJob"} {
+		if _, ok := spec.Components.Schemas[schemaName].Properties["openaiFileResponse"]; !ok {
+			t.Fatalf("%s.openaiFileResponse missing from OpenAPI", schemaName)
+		}
 	}
 }

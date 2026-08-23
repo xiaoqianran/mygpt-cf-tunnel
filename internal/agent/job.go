@@ -43,19 +43,24 @@ type commandJob struct {
 }
 
 type commandJobView struct {
-	ID         string     `json:"id"`
-	Status     string     `json:"status"`
-	Workdir    string     `json:"workdir"`
-	Revision   uint64     `json:"revision"`
-	ExitCode   *int       `json:"exit_code"`
-	Stdout     string     `json:"stdout"`
-	Stderr     string     `json:"stderr"`
-	TimedOut   bool       `json:"timed_out"`
-	Truncated  bool       `json:"truncated"`
-	DurationMS int64      `json:"duration_ms"`
-	Error      string     `json:"error,omitempty"`
-	StartedAt  time.Time  `json:"started_at"`
-	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	ID                   string     `json:"id"`
+	Status               string     `json:"status"`
+	Workdir              string     `json:"workdir"`
+	Revision             uint64     `json:"revision"`
+	ExitCode             *int       `json:"exit_code"`
+	Stdout               string     `json:"stdout"`
+	Stderr               string     `json:"stderr"`
+	TimedOut             bool       `json:"timed_out"`
+	Truncated            bool       `json:"truncated"`
+	InlineTruncated      bool       `json:"inline_truncated,omitempty"`
+	DurationMS           int64      `json:"duration_ms"`
+	Error                string     `json:"error,omitempty"`
+	StartedAt            time.Time  `json:"started_at"`
+	FinishedAt           *time.Time `json:"finished_at,omitempty"`
+	OpenAIFileResponse   []string   `json:"openaiFileResponse,omitempty"`
+	FullOutputAttached   bool       `json:"full_output_attached,omitempty"`
+	CaptureTruncated     bool       `json:"capture_truncated"`
+	OutputFileTTLSeconds int        `json:"output_file_ttl_seconds,omitempty"`
 }
 
 type jobStore struct {
@@ -92,8 +97,9 @@ func (s *Server) startJob(input commandInput) (string, error) {
 		changed:   make(chan struct{}),
 		cancel:    cancel,
 	}
-	job.stdout = s.newCappedBuffer()
-	job.stderr = s.newCappedBuffer()
+	pool := newCapturePool()
+	job.stdout = s.newCapturedBuffer(pool)
+	job.stderr = s.newCapturedBuffer(pool)
 	job.stdout.onWrite = func() { s.touchJob(id) }
 	job.stderr.onWrite = func() { s.touchJob(id) }
 
@@ -104,6 +110,8 @@ func (s *Server) startJob(input commandInput) (string, error) {
 
 	go func() {
 		result, err := s.runHostCommandTo(ctx, input.Command, input.Workdir, input.Stdin, input.TimeoutSeconds, job.stdout, job.stderr)
+		job.stdout.finalizeCapture()
+		job.stderr.finalizeCapture()
 		finished := time.Now().UTC()
 
 		s.jobs.mu.Lock()
@@ -149,6 +157,18 @@ func (s *Server) signalJobLocked(job *commandJob) {
 	job.changed = make(chan struct{})
 }
 
+func cleanupCommandJob(job *commandJob) {
+	if job == nil {
+		return
+	}
+	if job.stdout != nil {
+		job.stdout.cleanupCapture()
+	}
+	if job.stderr != nil {
+		job.stderr.cleanupCapture()
+	}
+}
+
 func (j *jobStore) pruneLocked(now time.Time) {
 	terminal := 0
 	for id, job := range j.jobs {
@@ -156,6 +176,7 @@ func (j *jobStore) pruneLocked(now time.Time) {
 			continue
 		}
 		if now.Sub(*job.FinishedAt) > jobRetention {
+			cleanupCommandJob(job)
 			delete(j.jobs, id)
 			continue
 		}
@@ -177,6 +198,7 @@ func (j *jobStore) pruneLocked(now time.Time) {
 		if oldestID == "" {
 			return
 		}
+		cleanupCommandJob(j.jobs[oldestID])
 		delete(j.jobs, oldestID)
 		terminal--
 	}
@@ -219,6 +241,16 @@ func (s *Server) getJob(id string, tailChars int) (commandJobView, <-chan struct
 		view.DurationMS = time.Since(view.StartedAt).Milliseconds()
 	}
 	return view, changed, true
+}
+
+func (s *Server) jobOutputState(id string) (*hostCommandResult, *cappedBuffer, *cappedBuffer, bool) {
+	s.jobs.mu.RLock()
+	defer s.jobs.mu.RUnlock()
+	job, ok := s.jobs.jobs[id]
+	if !ok {
+		return nil, nil, nil, false
+	}
+	return job.result, job.stdout, job.stderr, true
 }
 
 func (s *Server) cancelJob(id string) (string, bool) {
@@ -332,6 +364,11 @@ func (s *Server) handleGetCommandJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if after == nil || job.Status != "running" || job.Revision != *after || wait == 0 {
+			job, err = s.prepareJobActionView(requestOrigin(r), r.PathValue("id"), job)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
 			writeJSON(w, http.StatusOK, job)
 			return
 		}
@@ -341,6 +378,11 @@ func (s *Server) handleGetCommandJob(w http.ResponseWriter, r *http.Request) {
 			continue
 		case <-timeout:
 			job, _, _ = s.getJob(r.PathValue("id"), tailChars)
+			job, err = s.prepareJobActionView(requestOrigin(r), r.PathValue("id"), job)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
 			writeJSON(w, http.StatusOK, job)
 			return
 		case <-r.Context().Done():
