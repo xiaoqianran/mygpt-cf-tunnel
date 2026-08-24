@@ -1,0 +1,21 @@
+[Unit]
+Description=Cloudflare Tunnel (cloudflared)
+Documentation=https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cloudflared
+Group=cloudflared
+ExecStart=/usr/local/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run <你的-TUNNEL-UUID>
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=1048576
+
+# 允许 cloudflared 读写 mygpt-cf-tunnel 的 Unix Domain Socket（/var/run/mygpt-cf-tunnel.sock，权限 0666）。
+# 若 socket 所在目录需要额外访问权限，可按需添加 ReadWritePaths=/var/run。
+
+[Install]
+WantedBy=multi-user.target

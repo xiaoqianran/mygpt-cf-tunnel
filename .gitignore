@@ -1,11 +1,15 @@
-# Local secrets / runtime
+# Build output
+/bin/
+
+# Local secrets / runtime env
 .env
 .env.*
 !.env.example
+*.env
+!*.env.example
 
-# Build output
-bin/
-/mygpt-github-agent
+# Test / coverage
+coverage.out
 
 # Editor / OS
 .vscode/

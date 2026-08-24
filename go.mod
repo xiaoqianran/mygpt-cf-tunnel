@@ -1,3 +1,4 @@
 module github.com/xiaoqianran/mygpt-cf-tunnel
 
-go 1.23.0
+go 1.24
+

@@ -1,248 +1,80 @@
 # mygpt-cf-tunnel
 
-[![test](https://github.com/xiaoqianran/mygpt-cf-tunnel/actions/workflows/test.yml/badge.svg)](https://github.com/xiaoqianran/mygpt-cf-tunnel/actions/workflows/test.yml)
+一个供 Custom GPT Action 调用的轻量 Go 命令执行引擎。公网入口支持两种方式：
 
-> **中文完整文档：** [`README.zh-CN.md`](./README.zh-CN.md) · **Custom GPT 指令：** [`GPT_INSTRUCTIONS.md`](./GPT_INSTRUCTIONS.md)
+- **Caddy**：Caddy 负责公网 HTTPS，服务只监听 `127.0.0.1:8787`（默认）。
+- **Cloudflare Tunnel**：`cloudflared` 通过 QUIC 主动出站连接 Cloudflare 边缘，本地以 **Unix Domain Socket** 回源（`unix:/var/run/mygpt-cf-tunnel.sock`），详见 [docs/09-cloudflare-tunnel.md](./docs/09-cloudflare-tunnel.md)。
 
-把 Custom GPT 连接到一台真实 VPS 的 **通用 root shell**。Action 面保留同步 `runCommand`，并为长任务提供异步 `startCommand` / `getCommandJob` / `cancelCommandJob`。
+详细参考见 [docs/](./docs/README.md)：包含官方兼容性矩阵、架构、双向文件处理、部署运维、故障排查、安全模型、全链路审计和 Cloudflare Tunnel 极限部署。
 
-它不是 GitHub 工具集合，也不是预装 CLI 的固定能力列表。模型可以直接使用服务器已有能力；缺什么，就通过 root shell 安装什么，然后继续组合完成工作流。
+## 设计
 
-> **推荐 GPT 描述**：连接远程 VPS 的 root shell。通过 `runCommand`（短任务）或异步 Job（长任务）使用或自主安装所需软件，组合命令、程序、服务与网络能力，并完成服务器能够执行的任意工作流。
+- 一个 `runCommand` operation，保持 OpenAPI 与模型调用简单稳定。
+- 请求总时限最多 38 秒；超时会终止整个 POSIX 进程组。
+- 按 `Openai-Conversation-Id` 持久化当前目录，并用临时用户 ID 隔离会话。
+- 注入非交互环境，避免包管理器、pager 和 Git 凭据提示挂起。
+- 30,000 字符以内直接返回；更大输出通过短期签名 URL 作为 `openaiFileResponse` 文本附件返回。
+- 接收 `openaiFileIdRefs`，并立即下载到临时目录；命令通过 `$OPENAI_FILE_DIR` 和 `$OPENAI_FILE_PATHS_JSON` 使用文件。
+- Bearer 鉴权；可选 `ALLOWED_GPT_IDS`；上传下载域名默认仅允许 `*.oaiusercontent.com`。
+- Shell 退出码非零仍返回 HTTP 200，方便 GPT 读取错误并修正；协议错误使用 400，鉴权错误使用 401。
+- Caddy 公网入口日志与 Go JSONL 审计链共享 `trace_id`；记录鉴权、下载、执行、输出与失败阶段，并提供独立校验 CLI。
 
-可直接粘贴到 GPT Builder 的完整指令见 [`GPT_INSTRUCTIONS.md`](./GPT_INSTRUCTIONS.md)。
+> 这是远程 shell，不是沙箱。当前部署以 root 运行，Bearer token 等同于 VPS root 权限。只连接你信任的私有 GPT，并使用长随机 token。
 
-## 架构
-
-```text
-Custom GPT
-    │  HTTPS + Bearer API_TOKEN
-    ▼
-Cloudflare Tunnel
-    ▼
-127.0.0.1:8787
-Universal VPS Root Shell Agent (systemd, root)
-    │
-    └── runCommand
-          │
-          └── /bin/bash -lc <command>
-                 │
-                 ├── 使用服务器已有程序
-                 ├── apt / pip / npm / cargo / go install / curl ...
-                 ├── 安装新的运行时、CLI、库或系统包
-                 ├── 写脚本 / 编译程序 / 调 API / 管服务
-                 └── 组合成服务器能够执行的任意非交互式工作流
-```
-
-`gh`、`git`、`modal`、`kaggle`、Python、Node、Go、Docker、数据库客户端或云平台 CLI 都只是示例。**它们不是能力边界。**
-
-## 设计原则
-
-### 一个执行原语，两种生命周期
-
-OpenAPI 只围绕一个执行原语公开同步与异步生命周期：
-
-```text
-POST /v1/command/run
-POST /v1/command/start
-GET  /v1/command/jobs/{id}
-POST /v1/command/jobs/{id}/cancel
-```
-
-过去的 `syncRepository`、`readFiles`、`applyChanges`、`gitDiff`、`commitAndPush`、`createRelease` 等专用 API 已从代码中删除。
-
-仓库任务直接由 shell 完成，例如：
+## 部署
 
 ```bash
-gh repo clone owner/repo /srv/work/repo
-cd /srv/work/repo
-rg 'target'
-python3 scripts/change.py
-go test ./...
-git diff --check
-git add -A
-git commit -m 'change'
-git push
+make check build
+sudo install -m 0755 bin/mygpt-cf-tunnel /usr/local/bin/mygpt-cf-tunnel
+sudo install -m 0755 bin/mygpt-audit /usr/local/bin/mygpt-audit
+sudo install -m 0644 deploy/mygpt-cf-tunnel.service /etc/systemd/system/mygpt-cf-tunnel.service
+sudo install -m 0600 deploy/mygpt-cf-tunnel.env.example /etc/mygpt-cf-tunnel.env
+sudo systemctl daemon-reload
+sudo systemctl enable --now mygpt-cf-tunnel
 ```
 
-如果 `gh` 不存在，可以先安装；如果项目需要另一个运行时，也可以先安装那个运行时。工具选择属于工作流的一部分，而不是 Agent API 的一部分。
-
-### 能力可以在运行时扩展
-
-`runCommand` 是 root shell，所以模型可以先获取能力，再完成任务。例如：
+编辑 `/etc/mygpt-cf-tunnel.env`，至少设置随机 `API_TOKEN` 和真实 `ACTION_BASE_URL`。将 `deploy/Caddyfile.example` 的域名替换为你的域名，合并到现有 Caddyfile 后执行：
 
 ```bash
-apt-get update && apt-get install -y jq
-python3 -m pip install --user some-cli
-npm install -g some-cli
-cargo install some-cli
-go install example.com/tool@latest
-curl -fsSL https://example.com/install.sh | bash
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
 ```
 
-上述方式仍然只是示例。只要 VPS 的操作系统、网络和权限允许，可以采用适合目标的安装或构建方式。
+## 配置 Custom GPT
 
-### 真实主机，不是仓库 sandbox
+1. 在 Builder 中导入 `https://你的域名/openapi.json`。
+2. Authentication 选择 API Key、Bearer，并填入 `/etc/mygpt-cf-tunnel.env` 中的 `API_TOKEN`。
+3. 先测试 `pwd && hostname`。
 
-`workdir` 可以是 root 能访问的任意真实主机目录，默认 `/root`。命令可以管理系统包、进程、systemd 服务、文件、网络请求、代码、数据和部署目标。
-
-因此 `runCommand` 在 OpenAPI 中明确标记为：
-
-```json
-"x-openai-isConsequential": false
-```
-
-这是为了让已明确授权该 VPS 的用户无需对每次 `runCommand` 重复确认；`runCommand` 仍具有真实系统副作用，应仅连接到你信任并明确授权的 VPS。
-
-## OpenAPI 与 GPT 指令的职责边界
-
-OpenAPI 刻意保持简短。它只描述认证、命令执行的同步/异步生命周期、输入输出和真实副作用，不承担“教模型如何规划工作流”的职责。Custom GPT Builder 对 schema 结构和 description 长度有额外约束，因此复杂的能力说明放在 [`GPT_INSTRUCTIONS.md`](./GPT_INSTRUCTIONS.md)，而不是不断扩张 operation description。
-
-当前兼容约束包括：
-
-- `components.schemas` 显式描述命令结果与 Job 结果；大输出字段包含 GPT Actions 官方 `openaiFileResponse` 文件返回契约。
-- OpenAPI 中关键 `description` 保持在 300 字符以内。
-- Action 面只提供同一个 shell 执行原语的同步与异步生命周期；“缺工具就安装、按目标组合任意工作流”的行为策略由 GPT 指令表达。
-- CI 对上述约束做回归测试，避免 Builder 导入在后续修改中再次失效。
-
-## 长任务与 524
-
-> Custom GPT 的同步 Action 更早受 OpenAI **45 秒 round-trip** 限制，普通 Action request/response 还必须分别少于 **100,000 字符**。Cloudflare 默认 Proxy Read Timeout 是 **125 秒**。完整边界与来源见 [`CLOUDFLARE_TIMEOUTS.md`](./CLOUDFLARE_TIMEOUTS.md)。
-
-短任务使用 `runCommand`。可能接近 45 秒的任务使用 `startCommand`，立即取得 job id。`getCommandJob` 在 `running` 阶段暴露 rolling `stdout` / `stderr` 和单调递增的 `revision`。把上次 revision 作为 `after` 并设置 `wait_seconds=10`，服务端会在日志/状态变化时立即返回，而不是让客户端固定 sleep；完全无变化时才按约 10 秒 heartbeat 返回。长轮询默认只返回最近 12000 个 Unicode 字符，可用 `tail_chars` 调整。终态输出若能安全放进 Action JSON 就直接完整内联；过大时自动通过 `openaiFileResponse` 返回完整文本附件。Job 使用独立 context，观察请求断开不会取消任务；需要停止时显式调用 `cancelCommandJob`。终态 Job 最多保留 24 小时且最多保留最近 256 条；Agent 重启后会清空。
-
-## Action 请求
-
-```json
-{
-  "command": "set -euo pipefail\nuname -a\ncommand -v jq || apt-get update && apt-get install -y jq\njq --version",
-  "workdir": "/root",
-  "stdin": "",
-  "timeout_seconds": 300
-}
-```
-
-执行语义：
-
-```text
-root user
-  -> /bin/bash -lc
-  -> real VPS filesystem / network / processes / credentials
-```
-
-返回：
-
-```json
-{
-  "workdir": "/root",
-  "exit_code": 0,
-  "stdout": "...",
-  "stderr": "...",
-  "timed_out": false,
-  "truncated": false,
-  "duration_ms": 123
-}
-```
-
-`stdin` 可用于非交互式 CLI 输入、脚本、payload 或文件内容。
-
-当 stdout/stderr 太大而不适合放进单个 GPT Action JSON 时，返回体会保留约 6000 字符预览，并增加 `openaiFileResponse`、`inline_truncated`、`full_output_attached`、`capture_truncated`。当前实现按每片约 9.5 MB、最多 10 片捕获，约可完整携带 95 MB 文本输出。`truncated: false`、`inline_truncated: true`、`full_output_attached: true`、`capture_truncated: false` 表示只有内联预览被缩短，完整输出已经作为附件返回，并没有丢失；只有 `truncated: true` 才代表输出确实有丢失。
-
-`MAX_COMMAND_OUTPUT_CHARS` 只控制内存中的 rolling inline preview，不再是完整命令输出的总容量。不要通过无限提高该值试图突破 GPT Actions 的 JSON payload 限制。
-
-`timeout_seconds` 只能缩短本次调用的时间，不能突破服务器端 `COMMAND_TIMEOUT_SECONDS`。超时后 Agent 会终止整个 shell 进程组，避免留下意外的子进程。
-
-## 环境与凭据
-
-systemd 服务以 `root:root` 运行，并提供常见工具安装路径：
-
-```text
-/root/.local/bin
-/root/.cargo/bin
-/root/go/bin
-/usr/local/go/bin
-/usr/local/sbin
-/usr/local/bin
-/usr/sbin
-/usr/bin
-/sbin
-/bin
-/snap/bin
-```
-
-同时保留宿主机已有 PATH，并使用 root 的 login shell 配置。
-
-`/etc/mygpt-github-agent.env` 中除了 Agent 自己的配置外，其他环境变量也会被 `runCommand` 子进程继承。这样第三方 CLI 的 token 或非秘密配置可以留在 VPS，而不需要写进 GPT 指令。
-
-不要让模型为了“检查配置”而输出完整 `env`、token 文件或密钥。认证状态应尽量通过对应 CLI 的 status/auth 命令检查。
-
-## 安装 / 升级
-
-当前仍保留历史二进制和 systemd 单元名称 `mygpt-github-agent`，这是为了兼容已部署服务器的原地升级；它们不再代表 Agent 的能力边界。
-
-服务本身构建只要求 Go 1.23+：
+示例：
 
 ```bash
-git clone https://github.com/xiaoqianran/mygpt-cf-tunnel.git
-cd mygpt-cf-tunnel
-bash ./scripts/install.sh
+curl -sS https://action.example.com/v1/command/run \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"pwd && hostname"}'
 ```
 
-默认配置：
-
-```dotenv
-API_TOKEN=<random secret>
-LISTEN_ADDR=127.0.0.1:8787
-COMMAND_TIMEOUT_SECONDS=86400
-MAX_COMMAND_OUTPUT_CHARS=180000
-```
-
-安装后检查：
+上传文件时，命令可使用：
 
 ```bash
-curl http://127.0.0.1:8787/health
-curl -s http://127.0.0.1:8787/openapi.json | jq '.paths'
-systemctl status mygpt-github-agent
+printf '%s' "$OPENAI_FILE_PATHS_JSON" | jq -r '.[].path'
+unzip "$OPENAI_FILE_DIR/app.zip" -d ./app
 ```
 
-## Cloudflare Tunnel
+## OpenAI Actions 约束
 
-Agent 默认只监听：
+实现按官方当前文档收敛：API 往返 45 秒、请求/响应各小于 100,000 字符、TLS 1.2+ 且仅 443、endpoint 描述 300 字符以内、参数描述 700 字符以内。文件返回最多 10 个、每个 10 MB，URL 拉取超时 10 秒；返回文件不得是图片或视频。
 
-```text
-127.0.0.1:8787
-```
+参考：
 
-Cloudflare Tunnel 的 Published application 指向：
+- [Production notes on GPT Actions](https://developers.openai.com/api/docs/actions/production)
+- [Sending and returning files with GPT Actions](https://developers.openai.com/api/docs/actions/sending-files)
+- [Getting started with GPT Actions](https://developers.openai.com/api/docs/actions/getting-started)
+- [OpenAI Developer Forum：文件引用已知问题](https://community.openai.com/t/openaifileidrefs-not-auto-populated-in-action-call-createmap-publishing-fails/1374402/4)
+- [AI Server Commander：边界执行与进程组终止实践](https://github.com/Jhacarreiro/ai-server-commander)
+- [gpt-actions：简洁、可导入 Schema 实践](https://github.com/agisota/gpt-actions)
 
-```text
-http://localhost:8787
-```
+社区项目常见的边界执行、进程组终止、结构化结果和窄 REST surface 也被保留；文件引用功能仍可能遇到 Builder/平台侧已知问题，服务会对未展开的字符串引用返回可读的 400，而不是误执行命令。
 
-然后在 Custom GPT Actions 中导入：
-
-```text
-https://<你的域名>/openapi.json
-```
-
-认证使用 Bearer API Key，值为 `/etc/mygpt-github-agent.env` 中的 `API_TOKEN`。
-
-## 安全模型
-
-这是有意设计的高权限执行入口：
-
-```text
-Cloudflare Tunnel
-  -> Bearer API_TOKEN
-  -> root systemd service
-  -> /bin/bash -lc
-  -> VPS root 权限
-```
-
-因此：
-
-- `API_TOKEN` 等价于高权限远程执行凭据，必须保密。
-- Agent origin 应继续只监听 loopback，不要直接暴露公网。
-- root shell 可以安装软件、修改系统、删除文件、停止服务、访问 root 可读取的凭据；这是设计目标，不是 sandbox。
-- OpenAPI 把操作标记为 non-consequential，以避免已授权场景下的逐次确认；工具本身仍具有真实 root 级副作用。
-- `MAX_COMMAND_OUTPUT_CHARS` 只限制 rolling 内联预览；大型完整输出通过短期 `openaiFileResponse` 附件返回。超时由 `COMMAND_TIMEOUT_SECONDS` 控制。
+官方当前页面没有确认“最多 30 个 operation”“每个 GPT 同域名只能导入一个 Schema”以及这些 OpenAI 元数据 Header 的稳定性，因此本项目不把它们描述为官方契约。实现仍只暴露一个 operation，并将 Header 缺失视为可兼容的无状态调用。

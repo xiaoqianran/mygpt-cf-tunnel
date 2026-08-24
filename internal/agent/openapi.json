@@ -1,20 +1,46 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "Universal VPS Root Shell",
-    "version": "0.6.0",
-    "description": "Authenticated universal remote VPS root shell. It can install or use software and run arbitrary non-interactive workflows; installed tools are not a capability boundary. Large command output can be returned as GPT Action file attachments instead of oversized inline JSON."
+    "title": "MyGPT Cloudflare Tunnel VPS Command API",
+    "version": "1.1.0",
+    "description": "Runs authenticated, bounded, non-interactive Bash workflows on the connected VPS."
   },
   "servers": [
-    {
-      "url": "__SERVER_URL__"
-    }
+    { "url": "{{ACTION_BASE_URL}}" }
   ],
   "security": [
-    {
-      "BearerAuth": []
-    }
+    { "BearerAuth": [] }
   ],
+  "paths": {
+    "/v1/command/run": {
+      "post": {
+        "operationId": "runCommand",
+        "summary": "Run a Bash workflow on the VPS",
+        "description": "Runs one non-interactive Bash command or script. The current directory persists per OpenAI conversation. Nonzero shell exits are returned as HTTP 200 results. Large output is attached as downloadable text files.",
+        "x-openai-isConsequential": false,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CommandRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Command result. Inspect exit_code, stderr, timed_out, and output_truncated.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CommandResponse" }
+              }
+            }
+          },
+          "400": { "description": "Malformed JSON, invalid workdir, or invalid file reference." },
+          "401": { "description": "Missing or invalid Bearer token." }
+        }
+      }
+    }
+  },
   "components": {
     "securitySchemes": {
       "BearerAuth": {
@@ -24,366 +50,64 @@
       }
     },
     "schemas": {
-      "CommandInput": {
+      "CommandRequest": {
         "type": "object",
         "additionalProperties": false,
+        "required": ["command"],
         "properties": {
           "command": {
             "type": "string",
-            "description": "Any shell command or multiline script to execute with /bin/bash -lc. Multiple dependent steps may be combined into one script."
+            "description": "Bash command or multiline script. Uploaded files are available in $OPENAI_FILE_DIR; metadata and absolute paths are JSON in $OPENAI_FILE_PATHS_JSON."
           },
           "workdir": {
             "type": "string",
-            "description": "Optional absolute or relative host working directory. Defaults to /root. It is not restricted to a repository workspace."
+            "description": "Optional absolute path or path relative to the conversation's current directory."
           },
           "stdin": {
             "type": "string",
-            "description": "Optional standard input passed to the command. Useful for non-interactive CLI input, scripts, payloads and file content."
+            "description": "Optional standard input for the command."
           },
           "timeout_seconds": {
             "type": "integer",
             "minimum": 1,
-            "description": "Optional per-workflow timeout in seconds. It may shorten but cannot exceed the server-side COMMAND_TIMEOUT_SECONDS limit."
+            "maximum": 38,
+            "description": "Optional shorter timeout. The server always caps execution at 38 seconds."
+          },
+          "openaiFileIdRefs": {
+            "type": "array",
+            "maxItems": 10,
+            "items": { "type": "string" },
+            "description": "Up to 10 files from this conversation needed by the command. ChatGPT expands these references into temporary download objects at runtime."
           }
-        },
-        "required": [
-          "command"
-        ]
+        }
       },
-      "CommandJob": {
+      "CommandResponse": {
         "type": "object",
-        "additionalProperties": false,
+        "required": ["exit_code", "stdout", "stderr", "timed_out", "output_truncated", "duration_ms", "workdir"],
         "properties": {
-          "id": {
-            "type": "string"
-          },
-          "status": {
-            "type": "string",
-            "enum": [
-              "running",
-              "completed",
-              "failed",
-              "cancelled",
-              "timed_out"
-            ],
-            "description": "completed means exit code 0; a non-zero command exit is failed. Cancellation and timeout have distinct terminal states."
-          },
-          "workdir": {
-            "type": "string"
-          },
-          "exit_code": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "description": "Null while running; process exit code after completion."
-          },
-          "stdout": {
-            "type": "string",
-            "description": "Complete stdout for terminal jobs when it fits; otherwise a live or terminal preview."
-          },
-          "stderr": {
-            "type": "string",
-            "description": "Complete stderr for terminal jobs when it fits; otherwise a live or terminal preview."
-          },
-          "timed_out": {
-            "type": "boolean"
-          },
-          "truncated": {
-            "type": "boolean",
-            "description": "For running snapshots, true when the current response omits output. For terminal jobs, true only when some command output was actually lost."
-          },
-          "inline_truncated": {
-            "type": "boolean",
-            "description": "True when stdout/stderr in this JSON are only a preview. For terminal results, use openaiFileResponse for the complete output."
-          },
-          "duration_ms": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "error": {
-            "type": "string"
-          },
-          "started_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "finished_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "revision": {
-            "type": "integer",
-            "minimum": 1,
-            "description": "Monotonic job revision. Pass the last seen value as after to wait for the next change."
+          "exit_code": { "type": "integer", "description": "Shell exit code; nonzero is a command failure, not an HTTP failure." },
+          "stdout": { "type": "string", "description": "Full inline stdout or a short tail when the full stream is attached." },
+          "stderr": { "type": "string", "description": "Full inline stderr or a short tail when the full stream is attached." },
+          "timed_out": { "type": "boolean" },
+          "output_truncated": { "type": "boolean", "description": "True only when output exceeded the per-file 10 MB safety cap." },
+          "duration_ms": { "type": "integer", "minimum": 0 },
+          "workdir": { "type": "string", "description": "Conversation working directory after the command." },
+          "input_files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "id": { "type": "string" },
+                "mime_type": { "type": "string" },
+                "path": { "type": "string" }
+              }
+            }
           },
           "openaiFileResponse": {
             "type": "array",
-            "description": "Complete command output files returned through the GPT Actions file-response mechanism when inline JSON would be too large. Up to 10 text files may be returned.",
-            "items": {
-              "type": "string",
-              "format": "uri"
-            }
-          },
-          "full_output_attached": {
-            "type": "boolean",
-            "description": "True when the attached files contain all command output even if inline stdout/stderr are previews."
-          },
-          "capture_truncated": {
-            "type": "boolean",
-            "description": "True only when command output exceeded the attachment capture capacity; false means attached output is complete."
-          },
-          "output_file_ttl_seconds": {
-            "type": "integer",
-            "minimum": 1,
-            "description": "Lifetime of the unguessable attachment URLs."
-          }
-        },
-        "required": [
-          "id",
-          "status",
-          "workdir",
-          "revision",
-          "exit_code",
-          "stdout",
-          "stderr",
-          "timed_out",
-          "truncated",
-          "duration_ms",
-          "started_at"
-        ]
-      },
-      "CommandResult": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "workdir": {
-            "type": "string"
-          },
-          "exit_code": {
-            "type": "integer"
-          },
-          "stdout": {
-            "type": "string",
-            "description": "Complete inline stdout when it fits; otherwise a small preview while full output is attached."
-          },
-          "stderr": {
-            "type": "string",
-            "description": "Complete inline stderr when it fits; otherwise a small preview while full output is attached."
-          },
-          "timed_out": {
-            "type": "boolean"
-          },
-          "truncated": {
-            "type": "boolean",
-            "description": "True only when some command output was actually lost. False when complete output is inline or preserved in attached files."
-          },
-          "inline_truncated": {
-            "type": "boolean",
-            "description": "True when stdout/stderr in this JSON are only a preview. For terminal results, use openaiFileResponse for the complete output."
-          },
-          "duration_ms": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "openaiFileResponse": {
-            "type": "array",
-            "description": "Complete command output files returned through the GPT Actions file-response mechanism when inline JSON would be too large. Up to 10 text files may be returned.",
-            "items": {
-              "type": "string",
-              "format": "uri"
-            }
-          },
-          "full_output_attached": {
-            "type": "boolean",
-            "description": "True when the attached files contain all command output even if inline stdout/stderr are previews."
-          },
-          "capture_truncated": {
-            "type": "boolean",
-            "description": "True only when command output exceeded the attachment capture capacity; false means attached output is complete."
-          },
-          "output_file_ttl_seconds": {
-            "type": "integer",
-            "minimum": 1,
-            "description": "Lifetime of the unguessable attachment URLs."
-          }
-        },
-        "required": [
-          "workdir",
-          "exit_code",
-          "stdout",
-          "stderr",
-          "timed_out",
-          "truncated",
-          "duration_ms"
-        ]
-      }
-    }
-  },
-  "paths": {
-    "/v1/command/run": {
-      "post": {
-        "operationId": "runCommand",
-        "x-openai-isConsequential": false,
-        "summary": "Run a root shell workflow on the remote VPS",
-        "description": "Runs a non-interactive root shell workflow via /bin/bash -lc. Use for short work. GPT Actions time out long requests; prefer startCommand for long work. Oversized stdout/stderr is returned as attached text files.",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CommandInput"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Workflow finished. Large output may be delivered through openaiFileResponse attachments instead of oversized inline JSON.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CommandResult"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid request."
-          },
-          "401": {
-            "description": "Missing or invalid Bearer token."
-          },
-          "500": {
-            "description": "The shell could not be started or the requested workdir is unavailable."
-          }
-        }
-      }
-    },
-    "/v1/command/start": {
-      "post": {
-        "operationId": "startCommand",
-        "x-openai-isConsequential": false,
-        "summary": "Start a long-running root shell workflow",
-        "description": "Starts a root shell workflow independently of the HTTP request and immediately returns a job id. Prefer for long work; observe it with revision-based getCommandJob long polling.",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CommandInput"
-              }
-            }
-          }
-        },
-        "responses": {
-          "202": {
-            "description": "Job accepted. Use getCommandJob to poll until it reaches a terminal state."
-          },
-          "400": {
-            "description": "Invalid request."
-          },
-          "401": {
-            "description": "Missing or invalid Bearer token."
-          }
-        }
-      }
-    },
-    "/v1/command/jobs/{id}": {
-      "get": {
-        "operationId": "getCommandJob",
-        "x-openai-isConsequential": false,
-        "summary": "Get an asynchronous command job",
-        "description": "Returns a job snapshot. Use revision-based long polling while running. Terminal output is returned inline when safe, or as GPT Action text-file attachments when too large for one JSON payload.",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "after",
-            "in": "query",
-            "required": false,
-            "description": "Last revision already seen. If it still matches a running job, wait for a change instead of polling immediately.",
-            "schema": {
-              "type": "integer",
-              "minimum": 0
-            }
-          },
-          {
-            "name": "wait_seconds",
-            "in": "query",
-            "required": false,
-            "description": "Long-poll wait when after matches. Defaults to 10 seconds when after is supplied; maximum 20 seconds. Zero returns immediately.",
-            "schema": {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 20
-            }
-          },
-          {
-            "name": "tail_chars",
-            "in": "query",
-            "required": false,
-            "description": "Return only the newest N Unicode characters from each output stream. Long-poll requests default to 12000; ordinary snapshots return the full stored rolling output.",
-            "schema": {
-              "type": "integer",
-              "minimum": 1
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Current job snapshot. Terminal large output may include openaiFileResponse attachments containing the complete captured output.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CommandJob"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid Bearer token."
-          },
-          "404": {
-            "description": "Job not found."
-          },
-          "400": {
-            "description": "Invalid after, wait_seconds, or tail_chars."
-          }
-        }
-      }
-    },
-    "/v1/command/jobs/{id}/cancel": {
-      "post": {
-        "operationId": "cancelCommandJob",
-        "x-openai-isConsequential": false,
-        "summary": "Cancel an asynchronous command job",
-        "description": "Requests cancellation of a running job and its process group. Completed jobs are left unchanged.",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "202": {
-            "description": "Cancellation request accepted."
-          },
-          "401": {
-            "description": "Missing or invalid Bearer token."
-          },
-          "404": {
-            "description": "Job not found."
+            "items": { "type": "string", "format": "uri" },
+            "description": "Signed URLs for full text output files when inline output would be too large."
           }
         }
       }

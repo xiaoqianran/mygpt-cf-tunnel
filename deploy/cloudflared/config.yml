@@ -1,0 +1,40 @@
+# cloudflared 极限性能配置
+#
+# 部署说明见 docs/09-cloudflare-tunnel.md。
+# 将 <你的-TUNNEL-UUID> 与 <你的-TUNNEL-UUID>.json 替换为 `cloudflared tunnel create` 生成的凭据。
+#
+# 安装：
+#   sudo install -d -m 0755 /etc/cloudflared
+#   sudo install -m 0600 deploy/cloudflared/config.yml /etc/cloudflared/config.yml
+#   sudo install -m 0600 <你的-TUNNEL-UUID>.json /etc/cloudflared/<你的-TUNNEL-UUID>.json
+
+tunnel: <你的-TUNNEL-UUID>
+credentials-file: /etc/cloudflared/<你的-TUNNEL-UUID>.json
+
+# 1. 强制使用 QUIC (HTTP/3) 协议连接 Cloudflare 边缘节点，延迟最低、抗丢包、无队头阻塞。
+protocol: quic
+
+# 2. 全局本地回源参数调优
+originRequest:
+  # 关闭 Happy Eyeballs，避免本地 IPv6/IPv4 重复寻址延迟
+  noHappyEyeballs: true
+  # 连接本地服务的超时（本地服务应在 3 秒内建立连接）
+  connectTimeout: 3s
+  # TCP Keep-Alive 保持连接
+  tcpKeepAlive: 30s
+  # 保持本地空闲连接池（避免每个 Action 请求重新建连）
+  keepAliveConnections: 256
+  keepAliveTimeout: 90s
+  # 允许 HTTP 分块传输
+  disableChunkedEncoding: false
+
+# 3. 路由规则（Ingress）
+ingress:
+  # 选项 A（最推荐，零网络开销）：使用 Unix Domain Socket，消除本地 TCP 握手与协议栈开销。
+  - hostname: action.你的域名.com
+    service: unix:/var/run/mygpt-cf-tunnel.sock
+    originRequest:
+      httpHostHeader: action.你的域名.com
+
+  # 兜底规则（必须包含）
+  - service: http_status:404

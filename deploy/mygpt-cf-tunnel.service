@@ -1,0 +1,22 @@
+[Unit]
+Description=MyGPT Cloudflare Tunnel Action Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root
+EnvironmentFile=/etc/mygpt-cf-tunnel.env
+ExecStart=/usr/local/bin/mygpt-cf-tunnel
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=false
+PrivateTmp=true
+# Unix Domain Socket (/var/run/mygpt-cf-tunnel.sock，即 /run/mygpt-cf-tunnel.sock) 由 root 服务在
+# /run 下直接创建（权限 0666），cloudflared 以非 root 用户运行时仍可读写，无需额外目录配置。
+
+[Install]
+WantedBy=multi-user.target
