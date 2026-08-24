@@ -49,11 +49,18 @@ curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | tee /usr/share/keyri
 echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" > /etc/apt/sources.list.d/cloudflared.list
 apt-get update -qq && apt-get install -y cloudflared
 
-echo "===== [2/5] 注册隧道为系统服务 ====="
-# 同一隧道用同一个 token；重复执行只是重配同一条隧道，不会冲突
-cloudflared service install "${TUNNEL_TOKEN}"
-systemctl enable cloudflared >/dev/null 2>&1 || true
-systemctl restart cloudflared
+echo "===== [2/5] 启动 cloudflared 隧道（后台进程，不注册系统服务） ====="
+# 不注册为系统服务（容器内无 systemd / SysV 也能正常工作），
+# 直接以 nohup 后台进程方式跑隧道，跟 mygpt-cf-tunnel 保持一致。
+# 同一 token 重复执行只重启同一条隧道，不会冲突。
+pkill -f 'cloudflared tunnel --no-autoupdate' 2>/dev/null || true
+pkill -f 'cloudflared tunnel run' 2>/dev/null || true
+sleep 1
+mkdir -p /var/log/cloudflared
+nohup cloudflared tunnel --no-autoupdate run "${TUNNEL_TOKEN}" \
+  > /var/log/cloudflared/cloudflared.log 2>&1 &
+sleep 3
+echo "    cloudflared 已在后台运行，日志: /var/log/cloudflared/cloudflared.log"
 
 echo "===== [3/5] 编译并安装 mygpt-cf-tunnel ====="
 cd "$(dirname "$0")"
