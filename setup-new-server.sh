@@ -53,14 +53,16 @@ echo "===== [2/5] 启动 cloudflared 隧道（后台进程，不注册系统服�
 # 不注册为系统服务（容器内无 systemd / SysV 也能正常工作），
 # 直接以 nohup 后台进程方式跑隧道，跟 mygpt-cf-tunnel 保持一致。
 # 同一 token 重复执行只重启同一条隧道，不会冲突。
-pkill -f 'cloudflared tunnel --no-autoupdate' 2>/dev/null || true
+# 注意：token 模式必须用 `tunnel run --token`，不能把 token 当隧道名/ UUID 传入。
+pkill -f 'cloudflared tunnel --no-autoupdate run' 2>/dev/null || true
 pkill -f 'cloudflared tunnel run' 2>/dev/null || true
 sleep 1
 mkdir -p /var/log/cloudflared
-nohup cloudflared tunnel --no-autoupdate run "${TUNNEL_TOKEN}" \
+nohup cloudflared tunnel --no-autoupdate run --token "${TUNNEL_TOKEN}" \
   > /var/log/cloudflared/cloudflared.log 2>&1 &
 sleep 3
 echo "    cloudflared 已在后台运行，日志: /var/log/cloudflared/cloudflared.log"
+echo "    检查: tail -f /var/log/cloudflared/cloudflared.log"
 
 echo "===== [3/5] 编译并安装 mygpt-cf-tunnel ====="
 cd "$(dirname "$0")"
