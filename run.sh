@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
 # mygpt-cf-tunnel 一键部署/重启脚本（容器内直跑版，无 systemd）
-# 用法： sudo ./run.sh
 # 说明：不依赖 Caddy。公网入口由已存在的 cloudflared 隧道负责，
 #       本脚本只负责把 mygpt-cf-tunnel 跑起来并监听匹配的回源地址。
+#
+# 全部参数通过环境变量控制：
+#   API_TOKEN      （可选）自定义 API 令牌，不传则自动生成随机 token
+#   DOMAIN         （可选）默认 cnb.202820.xyz
+#   LISTEN_ADDR    （可选）默认 127.0.0.1:8787，必须 = Dashboard 隧道回源地址
+#   WORKSPACE_ROOT （可选）默认 /workspace/wk
+#
+# 用法：
+#   sudo ./run.sh
+#   API_TOKEN="xxx" DOMAIN="a.com" LISTEN_ADDR="127.0.0.1:9000" WORKSPACE_ROOT="/data" sudo ./run.sh
 set -euo pipefail
 
-# ===== 可改配置 =====
-DOMAIN="cnb.202820.xyz"          # 你的公网域名
-LISTEN_ADDR="127.0.0.1:8787"     # 必须与 Cloudflare Dashboard 隧道回源地址一致
-WORKSPACE_ROOT="/workspace/wk"   # 命令执行的默认工作目录
+# ===== 配置项（带默认值，可被环境变量覆盖） =====
+DOMAIN="${DOMAIN:-cnb.202820.xyz}"
+LISTEN_ADDR="${LISTEN_ADDR:-127.0.0.1:8787}"
+WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspace/wk}"
 STATE_DIR="/var/lib/mygpt-cf-tunnel"
-# ====================
+# ================================================
 
-# 自定义 API_TOKEN：可用环境变量 API_TOKEN="你的自定义token" 传入，否则自动生成随机 token。
-# 不要写死进仓库文件，避免凭据泄露。
+# API_TOKEN：可选，不传则自动生成随机 token
 if [ -n "${API_TOKEN:-}" ]; then
   TOKEN_SECRET="${API_TOKEN}"
 else
@@ -21,6 +29,8 @@ else
 fi
 
 cd "$(dirname "$0")"
+
+echo "配置确认: DOMAIN=${DOMAIN}  LISTEN_ADDR=${LISTEN_ADDR}  WORKSPACE_ROOT=${WORKSPACE_ROOT}"
 
 echo "[0/4] 创建工作目录"
 mkdir -p "${WORKSPACE_ROOT}"
@@ -53,16 +63,16 @@ AUDIT_FSYNC=true
 AUDIT_OUTPUT_CHARS=4000
 EOF
 else
-  echo "    /etc/mygpt-cf-tunnel.env 已存在"
-  # 若显式传入了自定义 API_TOKEN，则同步更新；否则保留原 token
+  echo "    /etc/mygpt-cf-tunnel.env 已存在，按需同步传入的参数"
+  # 仅当显式传入时才覆盖对应配置；未传则保留原值
   if [ -n "${API_TOKEN:-}" ]; then
-    echo "    同步自定义 API_TOKEN"
     sed -i "s|^API_TOKEN=.*|API_TOKEN=${TOKEN_SECRET}|" /etc/mygpt-cf-tunnel.env
     grep -q '^API_TOKEN=' /etc/mygpt-cf-tunnel.env || echo "API_TOKEN=${TOKEN_SECRET}" >> /etc/mygpt-cf-tunnel.env
-  else
-    echo "    保留原 API_TOKEN（未传入自定义值）"
   fi
-  # 始终同步 WORKSPACE_ROOT
+  sed -i "s|^ACTION_BASE_URL=.*|ACTION_BASE_URL=https://${DOMAIN}|" /etc/mygpt-cf-tunnel.env
+  grep -q '^ACTION_BASE_URL=' /etc/mygpt-cf-tunnel.env || echo "ACTION_BASE_URL=https://${DOMAIN}" >> /etc/mygpt-cf-tunnel.env
+  sed -i "s|^LISTEN_ADDR=.*|LISTEN_ADDR=${LISTEN_ADDR}|" /etc/mygpt-cf-tunnel.env
+  grep -q '^LISTEN_ADDR=' /etc/mygpt-cf-tunnel.env || echo "LISTEN_ADDR=${LISTEN_ADDR}" >> /etc/mygpt-cf-tunnel.env
   sed -i "s|^WORKSPACE_ROOT=.*|WORKSPACE_ROOT=${WORKSPACE_ROOT}|" /etc/mygpt-cf-tunnel.env
   grep -q '^WORKSPACE_ROOT=' /etc/mygpt-cf-tunnel.env || echo "WORKSPACE_ROOT=${WORKSPACE_ROOT}" >> /etc/mygpt-cf-tunnel.env
 fi
@@ -76,7 +86,7 @@ nohup /usr/local/bin/mygpt-cf-tunnel > /var/log/mygpt-cf-tunnel.log 2>&1 &
 sleep 2
 
 echo "[4/4] 验证"
-curl -fsS "http://127.0.0.1:8787/health" && echo "  <- 本地 OK"
+curl -fsS "http://127.0.0.1:${LISTEN_ADDR##*:}/health" && echo "  <- 本地 OK"
 
 TOKEN=$(grep '^API_TOKEN=' /etc/mygpt-cf-tunnel.env | cut -d= -f2-)
 echo ""

@@ -1,33 +1,47 @@
 #!/usr/bin/env bash
 # =====================================================================
 # 新服务器一键部署脚本：cloudflared 隧道 + mygpt-cf-tunnel 服务
+#
+# 全部参数通过环境变量控制：
+#   TUNNEL_TOKEN   （必填）你的 Cloudflare 隧道 token，无默认值
+#   API_TOKEN      （可选）自定义 API 令牌，不传则自动生成随机 token
+#   DOMAIN         （可选）默认 cnb.202820.xyz
+#   LISTEN_ADDR    （可选）默认 127.0.0.1:8787，必须 = Dashboard 隧道回源地址
+#   WORKSPACE_ROOT （可选）默认 /workspace/wk
+#
 # 用法（root 下）:
-#   TUNNEL_TOKEN="<你的隧道token>" API_TOKEN="<你的自定义API令牌>" bash setup-new-server.sh
-#   自定义 API_TOKEN 可选：不传则自动生成随机 token。
-# 铁律: LISTEN_ADDR 必须等于 Cloudflare Dashboard 里隧道的回源地址
+#   TUNNEL_TOKEN="<token>" bash setup-new-server.sh
+#   TUNNEL_TOKEN="<token>" API_TOKEN="xxx" DOMAIN="a.com" \
+#     LISTEN_ADDR="127.0.0.1:9000" WORKSPACE_ROOT="/data" bash setup-new-server.sh
+#
+# 安全：token 一律走环境变量，绝不写死进仓库文件。
 # =====================================================================
 set -euo pipefail
 
-# ===== 唯一需要改的配置 =====
-DOMAIN="cnb.202820.xyz"                 # 你的公网域名
-LISTEN_ADDR="127.0.0.1:8787"            # 必须 = Dashboard 隧道回源地址
-WORKSPACE_ROOT="/workspace/wk"
+# ===== 配置项（带默认值，可被环境变量覆盖） =====
+DOMAIN="${DOMAIN:-cnb.202820.xyz}"
+LISTEN_ADDR="${LISTEN_ADDR:-127.0.0.1:8787}"
+WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspace/wk}"
 STATE_DIR="/var/lib/mygpt-cf-tunnel"
-# =============================
+# ================================================
 
-# 隧道 token 从环境变量读，绝不写死在仓库文件里（避免凭据泄露）
+# 隧道 token：必填，从环境变量读
 if [ -z "${TUNNEL_TOKEN:-}" ]; then
-  echo "错误: 未提供隧道 token。用法: TUNNEL_TOKEN='<token>' bash $0" >&2
+  echo "错误: 未提供隧道 token。" >&2
+  echo "用法: TUNNEL_TOKEN='<token>' [API_TOKEN='xxx'] [DOMAIN='...'] [LISTEN_ADDR='...'] [WORKSPACE_ROOT='...'] bash $0" >&2
   exit 1
 fi
 
-# 自定义 API_TOKEN：可用环境变量 API_TOKEN 传入，否则自动生成随机 token。
+# API_TOKEN：可选，不传则自动生成随机 token
 if [ -n "${API_TOKEN:-}" ]; then
   TOKEN_SECRET="${API_TOKEN}"
-  echo "使用自定义 API_TOKEN（通过环境变量传入）"
+  echo "使用自定义 API_TOKEN（环境变量传入）"
 else
   TOKEN_SECRET="$(openssl rand -hex 32)"
+  echo "未传入 API_TOKEN，已自动生成随机 token"
 fi
+
+echo "配置确认: DOMAIN=${DOMAIN}  LISTEN_ADDR=${LISTEN_ADDR}  WORKSPACE_ROOT=${WORKSPACE_ROOT}"
 
 echo "===== [1/5] 安装 cloudflared ====="
 mkdir -p --mode=0755 /usr/share/keyrings
@@ -71,13 +85,18 @@ AUDIT_FSYNC=true
 AUDIT_OUTPUT_CHARS=4000
 EOF
 else
-  echo "    /etc/mygpt-cf-tunnel.env 已存在"
-  # 若显式传入了自定义 API_TOKEN，则同步更新；否则保留原 token
+  echo "    /etc/mygpt-cf-tunnel.env 已存在，按需同步传入的参数"
+  # 仅当显式传入时才覆盖对应配置；未传则保留原值
   if [ -n "${API_TOKEN:-}" ]; then
-    echo "    同步自定义 API_TOKEN"
     sed -i "s|^API_TOKEN=.*|API_TOKEN=${TOKEN_SECRET}|" /etc/mygpt-cf-tunnel.env
     grep -q '^API_TOKEN=' /etc/mygpt-cf-tunnel.env || echo "API_TOKEN=${TOKEN_SECRET}" >> /etc/mygpt-cf-tunnel.env
   fi
+  sed -i "s|^ACTION_BASE_URL=.*|ACTION_BASE_URL=https://${DOMAIN}|" /etc/mygpt-cf-tunnel.env
+  grep -q '^ACTION_BASE_URL=' /etc/mygpt-cf-tunnel.env || echo "ACTION_BASE_URL=https://${DOMAIN}" >> /etc/mygpt-cf-tunnel.env
+  sed -i "s|^LISTEN_ADDR=.*|LISTEN_ADDR=${LISTEN_ADDR}|" /etc/mygpt-cf-tunnel.env
+  grep -q '^LISTEN_ADDR=' /etc/mygpt-cf-tunnel.env || echo "LISTEN_ADDR=${LISTEN_ADDR}" >> /etc/mygpt-cf-tunnel.env
+  sed -i "s|^WORKSPACE_ROOT=.*|WORKSPACE_ROOT=${WORKSPACE_ROOT}|" /etc/mygpt-cf-tunnel.env
+  grep -q '^WORKSPACE_ROOT=' /etc/mygpt-cf-tunnel.env || echo "WORKSPACE_ROOT=${WORKSPACE_ROOT}" >> /etc/mygpt-cf-tunnel.env
 fi
 pkill -f '/usr/local/bin/mygpt-cf-tunnel' 2>/dev/null || true
 set -a; source /etc/mygpt-cf-tunnel.env; set +a
