@@ -3,15 +3,15 @@
 # 新服务器一键部署脚本：cloudflared 隧道 + mygpt-cf-tunnel 服务
 #
 # 全部参数通过环境变量控制：
-#   TUNNEL_TOKEN   （必填）你的 Cloudflare 隧道 token，无默认值
+#   CF_TUNNEL_TOKEN（必填）你的 Cloudflare 隧道 token，无默认值
 #   API_TOKEN      （可选）自定义 API 令牌，不传则自动生成随机 token
 #   DOMAIN         （可选）默认 cnb.202820.xyz
 #   LISTEN_ADDR    （可选）默认 127.0.0.1:8787，必须 = Dashboard 隧道回源地址
 #   WORKSPACE_ROOT （可选）默认 /workspace/wk
 #
 # 用法（root 下）:
-#   TUNNEL_TOKEN="<token>" bash setup-new-server.sh
-#   TUNNEL_TOKEN="<token>" API_TOKEN="xxx" DOMAIN="a.com" \
+#   CF_TUNNEL_TOKEN="<token>" bash setup-new-server.sh
+#   CF_TUNNEL_TOKEN="<token>" API_TOKEN="xxx" DOMAIN="a.com" \
 #     LISTEN_ADDR="127.0.0.1:9000" WORKSPACE_ROOT="/data" bash setup-new-server.sh
 #
 # 安全：token 一律走环境变量，绝不写死进仓库文件。
@@ -25,10 +25,12 @@ WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspace/wk}"
 STATE_DIR="/var/lib/mygpt-cf-tunnel"
 # ================================================
 
-# 隧道 token：必填，从环境变量读
-if [ -z "${TUNNEL_TOKEN:-}" ]; then
+# 隧道 token：必填，从环境变量读。
+# 用 CF_TUNNEL_TOKEN 而非 TUNNEL_TOKEN，避免与 cloudflared 内置的
+# TUNNEL_TOKEN 环境变量同名混淆。
+if [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
   echo "错误: 未提供隧道 token。" >&2
-  echo "用法: TUNNEL_TOKEN='<token>' [API_TOKEN='xxx'] [DOMAIN='...'] [LISTEN_ADDR='...'] [WORKSPACE_ROOT='...'] bash $0" >&2
+  echo "用法: CF_TUNNEL_TOKEN='<token>' [API_TOKEN='xxx'] [DOMAIN='...'] [LISTEN_ADDR='...'] [WORKSPACE_ROOT='...'] bash $0" >&2
   exit 1
 fi
 
@@ -58,7 +60,7 @@ pkill -f 'cloudflared tunnel --no-autoupdate run' 2>/dev/null || true
 pkill -f 'cloudflared tunnel run' 2>/dev/null || true
 sleep 1
 mkdir -p /var/log/cloudflared
-nohup cloudflared tunnel --no-autoupdate run --token "${TUNNEL_TOKEN}" \
+nohup cloudflared tunnel --no-autoupdate run --token "${CF_TUNNEL_TOKEN}" \
   > /var/log/cloudflared/cloudflared.log 2>&1 &
 sleep 3
 echo "    cloudflared 已在后台运行，日志: /var/log/cloudflared/cloudflared.log"
