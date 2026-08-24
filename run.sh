@@ -12,6 +12,14 @@ WORKSPACE_ROOT="/workspace/wk"   # 命令执行的默认工作目录
 STATE_DIR="/var/lib/mygpt-cf-tunnel"
 # ====================
 
+# 自定义 API_TOKEN：可用环境变量 API_TOKEN="你的自定义token" 传入，否则自动生成随机 token。
+# 不要写死进仓库文件，避免凭据泄露。
+if [ -n "${API_TOKEN:-}" ]; then
+  TOKEN_SECRET="${API_TOKEN}"
+else
+  TOKEN_SECRET="$(openssl rand -hex 32)"
+fi
+
 cd "$(dirname "$0")"
 
 echo "[0/4] 创建工作目录"
@@ -26,7 +34,7 @@ echo "[2/4] 生成配置 /etc/mygpt-cf-tunnel.env"
 if [ ! -f /etc/mygpt-cf-tunnel.env ]; then
   umask 077
   cat > /etc/mygpt-cf-tunnel.env <<EOF
-API_TOKEN=$(openssl rand -hex 32)
+API_TOKEN=${TOKEN_SECRET}
 ACTION_BASE_URL=https://${DOMAIN}
 LISTEN_ADDR=${LISTEN_ADDR}
 WORKSPACE_ROOT=${WORKSPACE_ROOT}
@@ -45,7 +53,16 @@ AUDIT_FSYNC=true
 AUDIT_OUTPUT_CHARS=4000
 EOF
 else
-  echo "    /etc/mygpt-cf-tunnel.env 已存在，保留原 token，仅同步 WORKSPACE_ROOT"
+  echo "    /etc/mygpt-cf-tunnel.env 已存在"
+  # 若显式传入了自定义 API_TOKEN，则同步更新；否则保留原 token
+  if [ -n "${API_TOKEN:-}" ]; then
+    echo "    同步自定义 API_TOKEN"
+    sed -i "s|^API_TOKEN=.*|API_TOKEN=${TOKEN_SECRET}|" /etc/mygpt-cf-tunnel.env
+    grep -q '^API_TOKEN=' /etc/mygpt-cf-tunnel.env || echo "API_TOKEN=${TOKEN_SECRET}" >> /etc/mygpt-cf-tunnel.env
+  else
+    echo "    保留原 API_TOKEN（未传入自定义值）"
+  fi
+  # 始终同步 WORKSPACE_ROOT
   sed -i "s|^WORKSPACE_ROOT=.*|WORKSPACE_ROOT=${WORKSPACE_ROOT}|" /etc/mygpt-cf-tunnel.env
   grep -q '^WORKSPACE_ROOT=' /etc/mygpt-cf-tunnel.env || echo "WORKSPACE_ROOT=${WORKSPACE_ROOT}" >> /etc/mygpt-cf-tunnel.env
 fi
