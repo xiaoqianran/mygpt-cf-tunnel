@@ -14,6 +14,7 @@
 - 按 `Openai-Conversation-Id` 持久化当前目录，并用临时用户 ID 隔离会话。
 - 注入非交互环境，避免包管理器、pager 和 Git 凭据提示挂起。
 - 30,000 字符以内直接返回；更大输出通过短期签名 URL 作为 `openaiFileResponse` 文本附件返回。
+- 对明确标记为只读、无副作用的命令支持最多 60 秒进程内结果缓存；重复请求可跳过 Bash 启动。普通未缓存命令会全局失效现有缓存。
 - 接收 `openaiFileIdRefs`，并立即下载到临时目录；命令通过 `$OPENAI_FILE_DIR` 和 `$OPENAI_FILE_PATHS_JSON` 使用文件。
 - Bearer 鉴权；可选 `ALLOWED_GPT_IDS`；上传下载域名默认仅允许 `*.oaiusercontent.com`。
 - Shell 退出码非零仍返回 HTTP 200，方便 GPT 读取错误并修正；协议错误使用 400，鉴权错误使用 401。
@@ -54,6 +55,17 @@ curl -sS https://action.example.com/v1/command/run \
   -H 'Content-Type: application/json' \
   -d '{"command":"pwd && hostname"}'
 ```
+
+只读短缓存示例（不要用于写文件、安装、重启、部署等有副作用命令）：
+
+```bash
+curl -sS https://action.example.com/v1/command/run \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"command":"git status --short","cache_ttl_seconds":10}'
+```
+
+命中缓存时会返回 `cache_hit: true` 与 `cache_age_ms`，并且不会再次启动 Bash。默认不传 `cache_ttl_seconds` 时行为与旧版本完全一致。
 
 上传文件时，命令可使用：
 

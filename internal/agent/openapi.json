@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "MyGPT Cloudflare Tunnel VPS Command API",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "description": "Runs authenticated, bounded, non-interactive Bash workflows on the connected VPS."
   },
   "servers": [
@@ -73,6 +73,12 @@
             "maximum": 38,
             "description": "Optional shorter timeout. The server always caps execution at 38 seconds."
           },
+          "cache_ttl_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 60,
+            "description": "Optional in-memory cache TTL for commands guaranteed to be read-only and side-effect-free. Use a short TTL such as 5-10 seconds for repeated status/list/read checks. Never use it for writes, installs, restarts, deployments, or other state-changing commands."
+          },
           "openaiFileIdRefs": {
             "type": "array",
             "maxItems": 10,
@@ -83,7 +89,7 @@
       },
       "CommandResponse": {
         "type": "object",
-        "required": ["exit_code", "stdout", "stderr", "timed_out", "output_truncated", "duration_ms", "workdir"],
+        "required": ["exit_code", "stdout", "stderr", "timed_out", "output_truncated", "duration_ms", "cache_hit", "cache_age_ms", "workdir"],
         "properties": {
           "exit_code": { "type": "integer", "description": "Shell exit code; nonzero is a command failure, not an HTTP failure." },
           "stdout": { "type": "string", "description": "Full inline stdout or a short tail when the full stream is attached." },
@@ -91,6 +97,8 @@
           "timed_out": { "type": "boolean" },
           "output_truncated": { "type": "boolean", "description": "True only when output exceeded the per-file 10 MB safety cap." },
           "duration_ms": { "type": "integer", "minimum": 0 },
+          "cache_hit": { "type": "boolean", "description": "True when this response came from the in-memory cache and Bash was not started." },
+          "cache_age_ms": { "type": "integer", "minimum": 0, "description": "Age of the cached result in milliseconds; 0 for a fresh execution." },
           "workdir": { "type": "string", "description": "Conversation working directory after the command." },
           "input_files": {
             "type": "array",

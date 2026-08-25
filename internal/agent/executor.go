@@ -22,6 +22,7 @@ type commandRequest struct {
 	Workdir          string            `json:"workdir,omitempty"`
 	Stdin            string            `json:"stdin,omitempty"`
 	TimeoutSeconds   int               `json:"timeout_seconds,omitempty"`
+	CacheTTLSeconds  int               `json:"cache_ttl_seconds,omitempty"`
 	OpenAIFileIDRefs []json.RawMessage `json:"openaiFileIdRefs,omitempty"`
 }
 
@@ -32,6 +33,8 @@ type commandResponse struct {
 	TimedOut           bool        `json:"timed_out"`
 	OutputTruncated    bool        `json:"output_truncated"`
 	DurationMS         int64       `json:"duration_ms"`
+	CacheHit           bool        `json:"cache_hit"`
+	CacheAgeMS         int64       `json:"cache_age_ms"`
 	Workdir            string      `json:"workdir"`
 	InputFiles         []savedFile `json:"input_files,omitempty"`
 	OpenAIFileResponse []string    `json:"openaiFileResponse,omitempty"`

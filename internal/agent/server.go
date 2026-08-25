@@ -30,6 +30,7 @@ type Server struct {
 	sessions        *sessionStore
 	artifacts       *artifactStore
 	audit           *audit.Recorder
+	commandCache    *commandCache
 	uploadTransport http.RoundTripper
 	mux             *http.ServeMux
 }
@@ -85,7 +86,8 @@ func New(cfg Config, log *slog.Logger) (*Server, error) {
 	}
 	s := &Server{
 		cfg: cfg, log: log, sessions: sessions, artifacts: artifacts,
-		audit: audit.NewRecorder(sink), uploadTransport: http.DefaultTransport, mux: http.NewServeMux(),
+		audit: audit.NewRecorder(sink), commandCache: newCommandCache(),
+		uploadTransport: http.DefaultTransport, mux: http.NewServeMux(),
 	}
 	s.mux.HandleFunc("GET /health", s.health)
 	s.mux.HandleFunc("GET /openapi.json", s.openapi)
@@ -212,6 +214,16 @@ func (s *Server) runCommand(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "command is required")
 		return
 	}
+	if req.CacheTTLSeconds < 0 || time.Duration(req.CacheTTLSeconds)*time.Second > maxCommandCacheTTL {
+		s.auditEvent(r.Context(), "request.validation", "failed", map[string]any{"reason": "invalid_cache_ttl"})
+		writeError(w, http.StatusBadRequest, "cache_ttl_seconds must be between 0 and 60")
+		return
+	}
+	if req.CacheTTLSeconds > 0 && len(req.OpenAIFileIDRefs) > 0 {
+		s.auditEvent(r.Context(), "request.validation", "failed", map[string]any{"reason": "cache_with_input_files"})
+		writeError(w, http.StatusBadRequest, "cache_ttl_seconds cannot be used with openaiFileIdRefs")
+		return
+	}
 	requestID, _ := r.Context().Value(requestIDKey{}).(string)
 	if requestID == "" {
 		generatedID, generateErr := randomID()
@@ -225,7 +237,7 @@ func (s *Server) runCommand(w http.ResponseWriter, r *http.Request) {
 		"command": req.Command, "command_bytes": len(req.Command), "command_sha256": hashText(req.Command),
 		"stdin_bytes": len(req.Stdin), "stdin_sha256": hashText(req.Stdin),
 		"requested_workdir": req.Workdir, "requested_timeout_seconds": req.TimeoutSeconds,
-		"file_ref_count": len(req.OpenAIFileIDRefs),
+		"cache_ttl_seconds": req.CacheTTLSeconds, "file_ref_count": len(req.OpenAIFileIDRefs),
 	})
 	baseURL, err := s.publicBaseURL(r)
 	if err != nil {
@@ -239,10 +251,44 @@ func (s *Server) runCommand(w http.ResponseWriter, r *http.Request) {
 		userID: r.Header.Get("Openai-Ephemeral-User-Id"), gptID: gptID, baseURL: baseURL,
 	}
 	key := sessionKey(meta.conversationID, meta.userID)
+	cacheScope := key
+	if cacheScope != "" && meta.gptID != "" {
+		cacheScope = meta.gptID + "\x00" + cacheScope
+	}
 	s.auditEvent(r.Context(), "session.lock", "waiting", map[string]any{"session_key_sha256": hashIdentifier(key)})
 	unlock := s.sessions.lock(key)
 	defer unlock()
 	s.auditEvent(r.Context(), "session.lock", "acquired", map[string]any{"session_key_sha256": hashIdentifier(key)})
+
+	startDir := s.sessions.get(key)
+	cacheWorkdir, err := resolveWorkdir(startDir, req.Workdir)
+	if err != nil {
+		s.auditEvent(r.Context(), "execution.prepare", "failed", map[string]any{"requested_workdir": req.Workdir, "error": err.Error()})
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	cacheGeneration := uint64(0)
+	if req.CacheTTLSeconds > 0 && cacheScope != "" {
+		if cached, age, generation, ok := s.commandCache.get(cacheScope, cacheWorkdir, req, time.Now()); ok {
+			cached.CacheHit = true
+			cached.CacheAgeMS = age.Milliseconds()
+			cached.DurationMS = 0
+			s.auditEvent(r.Context(), "command.cache", "hit", map[string]any{
+				"cache_age_ms": cached.CacheAgeMS, "cache_ttl_seconds": req.CacheTTLSeconds,
+			})
+			s.log.Info("command cache hit", "request_id", requestID, "cache_age_ms", cached.CacheAgeMS)
+			writeJSON(w, http.StatusOK, cached)
+			return
+		} else {
+			cacheGeneration = generation
+		}
+		s.auditEvent(r.Context(), "command.cache", "miss", map[string]any{"cache_ttl_seconds": req.CacheTTLSeconds})
+	} else if req.CacheTTLSeconds > 0 {
+		s.auditEvent(r.Context(), "command.cache", "bypassed", map[string]any{"reason": "missing_session_identity"})
+	} else {
+		removed := s.commandCache.invalidateAll()
+		s.auditEvent(r.Context(), "command.cache", "invalidated", map[string]any{"entry_count": removed, "scope": "global", "phase": "before_execution"})
+	}
 
 	timeout := requestTimeout(req.TimeoutSeconds, s.cfg.CommandTimeout)
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
@@ -259,7 +305,11 @@ func (s *Server) runCommand(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	resp, err := s.execute(ctx, req, s.sessions.get(key), inputDir, files, meta)
+	resp, err := s.execute(ctx, req, startDir, inputDir, files, meta)
+	if req.CacheTTLSeconds == 0 {
+		removed := s.commandCache.invalidateAll()
+		s.auditEvent(r.Context(), "command.cache", "invalidated", map[string]any{"entry_count": removed, "scope": "global", "phase": "after_execution"})
+	}
 	if err != nil {
 		s.auditEvent(r.Context(), "execution", "failed", map[string]any{"error": err.Error()})
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -270,6 +320,16 @@ func (s *Server) runCommand(w http.ResponseWriter, r *http.Request) {
 		s.log.Error("persist session", "request_id", requestID, "error", err)
 	} else {
 		s.auditEvent(r.Context(), "session.persist", "succeeded", map[string]any{"workdir": resp.Workdir})
+	}
+	if req.CacheTTLSeconds > 0 && cacheScope != "" && resp.ExitCode == 0 && !resp.TimedOut && !resp.OutputTruncated && len(resp.OpenAIFileResponse) == 0 && resp.Workdir == cacheWorkdir {
+		ttl := time.Duration(req.CacheTTLSeconds) * time.Second
+		if s.commandCache.putIfGeneration(cacheScope, cacheWorkdir, req, resp, ttl, cacheGeneration, time.Now()) {
+			s.auditEvent(r.Context(), "command.cache", "stored", map[string]any{"cache_ttl_seconds": req.CacheTTLSeconds})
+		} else {
+			s.auditEvent(r.Context(), "command.cache", "store_skipped", map[string]any{"reason": "generation_changed"})
+		}
+	} else if req.CacheTTLSeconds > 0 && resp.Workdir != cacheWorkdir {
+		s.auditEvent(r.Context(), "command.cache", "store_skipped", map[string]any{"reason": "workdir_changed"})
 	}
 	s.log.Info("command finished", "request_id", requestID, "exit_code", resp.ExitCode,
 		"timed_out", resp.TimedOut, "duration_ms", resp.DurationMS, "attachments", len(resp.OpenAIFileResponse))

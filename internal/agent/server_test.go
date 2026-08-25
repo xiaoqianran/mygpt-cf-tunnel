@@ -301,3 +301,127 @@ func TestSafeFilename(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestCommandCacheHitSkipsExecution(t *testing.T) {
+	s := testServer(t, 30_000)
+	headers := map[string]string{"Authorization": "Bearer test-token", "Openai-Conversation-Id": "cache-conversation"}
+	marker := filepath.Join(s.cfg.WorkspaceRoot, "marker")
+	body := `{"command":"printf x >> marker; wc -c < marker","cache_ttl_seconds":60}`
+
+	first := call(t, s, body, headers)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status %d: %s", first.Code, first.Body.String())
+	}
+	second := call(t, s, body, headers)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status %d: %s", second.Code, second.Body.String())
+	}
+	var cached commandResponse
+	if err := json.Unmarshal(second.Body.Bytes(), &cached); err != nil {
+		t.Fatal(err)
+	}
+	if !cached.CacheHit || strings.TrimSpace(cached.Stdout) != "1" || cached.DurationMS != 0 {
+		t.Fatalf("expected cache hit: %+v", cached)
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "x" {
+		t.Fatalf("cached command executed twice: %q", data)
+	}
+}
+
+func TestNonCachedCommandInvalidatesGlobalCache(t *testing.T) {
+	s := testServer(t, 30_000)
+	readerHeaders := map[string]string{"Authorization": "Bearer test-token", "Openai-Conversation-Id": "cache-reader"}
+	writerHeaders := map[string]string{"Authorization": "Bearer test-token", "Openai-Conversation-Id": "cache-writer"}
+	if w := call(t, s, `{"command":"cat state.txt 2>/dev/null || true","cache_ttl_seconds":60}`, readerHeaders); w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	if w := call(t, s, `{"command":"printf updated > state.txt"}`, writerHeaders); w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	w := call(t, s, `{"command":"cat state.txt 2>/dev/null || true","cache_ttl_seconds":60}`, readerHeaders)
+	var result commandResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.CacheHit || strings.TrimSpace(result.Stdout) != "updated" {
+		t.Fatalf("stale cache survived global invalidation: %+v", result)
+	}
+}
+
+func TestCommandCacheRejectsInvalidUse(t *testing.T) {
+	s := testServer(t, 30_000)
+	headers := map[string]string{"Authorization": "Bearer test-token"}
+	if w := call(t, s, `{"command":"pwd","cache_ttl_seconds":61}`, headers); w.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid ttl to fail, got %d: %s", w.Code, w.Body.String())
+	}
+	body := `{"command":"pwd","cache_ttl_seconds":10,"openaiFileIdRefs":["file-test"]}`
+	if w := call(t, s, body, headers); w.Code != http.StatusBadRequest {
+		t.Fatalf("expected cache with files to fail, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCommandCacheGenerationRejectsStaleStore(t *testing.T) {
+	cache := newCommandCache()
+	req := commandRequest{Command: "cat state.txt", CacheTTLSeconds: 10}
+	now := time.Now()
+	_, _, generation, ok := cache.get("session", "/tmp", req, now)
+	if ok {
+		t.Fatal("unexpected cache hit")
+	}
+	cache.invalidateAll()
+	stored := cache.putIfGeneration("session", "/tmp", req, commandResponse{ExitCode: 0, Workdir: "/tmp", Stdout: "old"}, 10*time.Second, generation, now.Add(time.Millisecond))
+	if stored {
+		t.Fatal("stale read was stored after cache generation changed")
+	}
+}
+
+func TestCommandCacheBypassedWithoutSessionIdentity(t *testing.T) {
+	s := testServer(t, 30_000)
+	headers := map[string]string{"Authorization": "Bearer test-token"}
+	body := `{"command":"printf x >> marker; wc -c < marker","cache_ttl_seconds":60}`
+
+	first := call(t, s, body, headers)
+	second := call(t, s, body, headers)
+	if first.Code != http.StatusOK || second.Code != http.StatusOK {
+		t.Fatalf("unexpected statuses: %d, %d", first.Code, second.Code)
+	}
+	var result commandResponse
+	if err := json.Unmarshal(second.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.CacheHit || strings.TrimSpace(result.Stdout) != "2" {
+		t.Fatalf("request without session identity should bypass cache: %+v", result)
+	}
+}
+
+func TestWorkdirChangingCommandIsNotCached(t *testing.T) {
+	s := testServer(t, 30_000)
+	headers := map[string]string{"Authorization": "Bearer test-token", "Openai-Conversation-Id": "cache-cwd"}
+	bodyBytes, err := json.Marshal(map[string]any{
+		"command":           "cd /; pwd",
+		"workdir":           s.cfg.WorkspaceRoot,
+		"cache_ttl_seconds": 60,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(bodyBytes)
+	if w := call(t, s, body, headers); w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	w := call(t, s, body, headers)
+	if w.Code != http.StatusOK {
+		t.Fatal(w.Body.String())
+	}
+	var result commandResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.CacheHit {
+		t.Fatalf("cwd-changing command must not be cached: %+v", result)
+	}
+}

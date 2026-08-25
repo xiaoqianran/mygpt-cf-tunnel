@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	Version             = "1.1.0"
+	Version             = "1.2.0"
 	defaultTimeout      = 38 * time.Second
 	defaultInlineChars  = 30_000
 	defaultArtifactSize = 10_000_000
